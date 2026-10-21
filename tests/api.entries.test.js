@@ -1,80 +1,633 @@
+'use strict';
 
 var request = require('supertest');
-var should = require('should');
 var load = require('./fixtures/load');
+var bootevent = require('../lib/server/bootevent');
+var language = require('../lib/language')();
+
+require('should');
+
+const FIVE_MINUTES=1000*60*5;
 
 describe('Entries REST api', function ( ) {
   var entries = require('../lib/api/entries/');
+  var self = this;
+  var known = 'b723e97aa97846eb92d5264f084b2823f57c4aa1';
+
+  this.timeout(10000);
   before(function (done) {
-    var env = require('../env')( );
-    this.wares = require('../lib/middleware/')(env);
-    var store = require('../lib/storage')(env);
-    this.archive = require('../lib/entries').storage(env.mongo_collection, store);
-    this.app = require('express')( );
-    this.app.enable('api');
-    var self = this;
-    store(function ( ) {
-      self.app.use('/', entries(self.app, self.wares, self.archive));
-      self.archive.create(load('json'), done);
+    delete process.env.API_SECRET;
+    process.env.API_SECRET = 'this is my long pass phrase';
+    self.env = require('../lib/server/env')( );
+    self.env.settings.authDefaultRoles = 'readable';
+    self.wares = require('../lib/middleware/')(self.env);
+    self.archive = null;
+    self.app = require('express')( );
+    self.app.enable('api');
+    bootevent(self.env, language).boot(function booted (ctx) {
+      self.app.use('/', entries(self.app, self.wares, ctx, self.env));
+      self.archive = require('../lib/server/entries')(self.env, ctx);
+      self.ctx = ctx;
+      done();
     });
   });
-  after(function (done) {
-    this.archive( ).remove({ }, done);
+
+  beforeEach(function (done) {
+    var creating = load('json');
+
+    for (let i = 0; i < 20; i++) {
+      const e = {type: 'sgv', sgv: 100, date: Date.now()};
+      e.date = e.date - FIVE_MINUTES * i;
+      creating.push(e);
+    }    creating = creating.sort((a, b) => a.date - b.date);
+
+    function setupDone() {
+      console.log('Setup complete');
+      done();
+    }
+
+    function waitForASecond() {
+      // wait for event processing of cache entries to actually finish
+      setTimeout(function() {
+        setupDone();
+       }, 100);
+    }
+
+    self.archive.create(creating, waitForASecond);
+
   });
 
-  it('should be a module', function ( ) {
-    entries.should.be.ok;
-
+  afterEach(async function () {
+    await self.archive( ).deleteMany({ });
   });
-  it('/entries.json', function (done) {
-    request(this.app)
+
+  after(async function () {
+    await self.archive( ).deleteMany({ });
+  });
+
+  // keep this test pinned at or near the top in order to validate all
+  // entries successfully uploaded. if res.body.length is short of the
+  // expected value, it may indicate a regression in the create
+  // function callback logic in entries.js.
+  it('gets requested number of entries', function (done) {
+    var count = 30;
+    request(self.app)
+      .get('/entries.json?find[dateString][$gte]=2014-07-19&count=' + count)
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(count);
+        done();
+      });
+  });
+
+  it('gets default number of entries', function (done) {
+    var defaultCount = 10;
+    request(self.app)
+      .get('/entries/sgv.json?find[dateString][$gte]=2014-07-19&find[dateString][$lte]=2014-07-20')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(defaultCount);
+        done( );
+      });
+  });
+
+  it('gets entries in right order', function (done) {
+    var defaultCount = 10;
+    request(self.app)
+      .get('/entries/sgv.json?find[dateString][$gte]=2014-07-19&find[dateString][$lte]=2014-07-20')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(defaultCount);
+
+        var array = res.body;
+        var firstEntry = array[0];
+        var secondEntry = array[1];
+
+        firstEntry.date.should.be.above(secondEntry.date);
+
+        done( );
+      });
+  });
+
+  it('gets entries in right order without type specifier', function (done) {
+    var defaultCount = 10;
+    request(self.app)
       .get('/entries.json')
       .expect(200)
-      .end(function (err, res)  {
-        // console.log('body', res.body);
-        res.body.length.should.equal(10);
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(defaultCount);
+
+        var array = res.body;
+        var firstEntry = array[0];
+        var secondEntry = array[1];
+
+        firstEntry.date.should.be.above(secondEntry.date);
+
         done( );
       });
   });
 
-  it('/entries.json', function (done) {
-    request(this.app)
-      .get('/entries.json?count=30')
+  /* The untyped cached read used to deep-clone the whole retained window before
+   * slicing ten documents out of it. It now slices first and clones the slice.
+   * The response must not move: cloning first cannot change what comes back, so
+   * compare the two shapes at the HTTP layer rather than reasoning about it.
+   */
+  it('serves the same body whether or not the cache is cloned before slicing', function (done) {
+    var ctx = self.ctx;
+    var cheapRead = ctx.cache.getDataRef;
+    var before = ctx.cache.entries.slice( );
+    var beforeJson = JSON.stringify(ctx.cache.entries);
+
+    request(self.app)
+      .get('/entries.json?count=10')
       .expect(200)
-      .end(function (err, res)  {
-        // console.log('body', res.body);
-        res.body.length.should.equal(30);
+      .end(function (err, sliced) {
+        if (err) return done(err);
+
+        // the shape this endpoint had before: clone the whole array, then slice
+        ctx.cache.getDataRef = function (datatype) { return ctx.cache.getData(datatype); };
+
+        request(self.app)
+          .get('/entries.json?count=10')
+          .expect(200)
+          .end(function (err2, cloned) {
+            ctx.cache.getDataRef = cheapRead;
+            if (err2) return done(err2);
+
+            sliced.body.should.be.instanceof(Array).and.have.lengthOf(10);
+            sliced.body.should.eql(cloned.body);
+
+            // and reading must not reorder, replace or write to the cache's
+            // own documents
+            ctx.cache.entries.should.have.lengthOf(before.length);
+            for (var i = 0; i < before.length; i++) {
+              (ctx.cache.entries[i] === before[i]).should.equal(true);
+            }
+            JSON.stringify(ctx.cache.entries).should.equal(beforeJson);
+            done( );
+          });
+      });
+  });
+
+  it('/echo/ api shows query', function (done) {
+    request(self.app)
+      .get('/echo/entries/sgv.json?find[dateString][$gte]=2014-07-19&find[dateString][$lte]=2014-07-20')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Object);
+        res.body.query.should.be.instanceof(Object);
+        res.body.input.should.be.instanceof(Object);
+        res.body.input.find.should.be.instanceof(Object);
+        res.body.storage.should.equal('entries');
         done( );
       });
+  });
+
+  it('/slice/ can slice time', function (done) {
+    var app = self.app;
+    request(app)
+      .get('/slice/entries/dateString/sgv/2014-07.json?count=20')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(20);
+        done( );
+      });
+  });
+
+
+  it('/times/echo can describe query', function (done) {
+    var app = self.app;
+    request(app)
+      .get('/times/echo/2014-07/.*T{00..05}:.json?count=20&find[sgv][$gte]=160')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Object);
+        res.body.req.should.have.property('query');
+        res.body.should.have.property('pattern').with.lengthOf(6);
+        done( );
+      });
+  });
+
+  it('/slice/ can slice with multiple prefix', function (done) {
+    var app = self.app;
+    request(app)
+      .get('/slice/entries/dateString/sgv/2014-07-{17..20}.json?count=20')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(20);
+        done( );
+      });
+  });
+
+  it('/slice/ can slice time with prefix and no results', function (done) {
+    var app = self.app;
+    request(app)
+      .get('/slice/entries/dateString/sgv/1999-07.json?count=20&find[sgv][$lte]=401')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(0);
+        done( );
+      });
+  });
+
+  it('/times/ can get modal times', function (done) {
+    var app = self.app;
+    request(app)
+      .get('/times/2014-07-/{0..30}T.json?')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(10);
+        done( );
+      });
+  });
+
+  it('/times/ can get modal minutes and times', function (done) {
+    var app = self.app;
+    request(app)
+      .get('/times/20{14..15}-07/T{09..10}.json?')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(10);
+        done( );
+      });
+  });
+  it('/times/ can get multiple prefixen and modal minutes and times', function (done) {
+    var app = self.app;
+    request(app)
+      .get('/times/20{14..15}/T.*:{00..60}.json?')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(10);
+        done( );
+      });
+  });
+
+  describe('brace patterns are capped at 2000 expansions', function ( ) {
+    // Six chained groups of ten alternatives: a million patterns.
+    var million = '20' + '{0..9}'.repeat(6);
+
+    function refused (url, done) {
+      var started = Date.now();
+      request(self.app)
+        .get(url)
+        .expect(400)
+        .end(function (err, res) {
+          if (err) return done(err);
+          (Date.now() - started).should.be.below(500);
+          res.body.status.should.equal(400);
+          res.body.description.should.match(/at most 2000 patterns/);
+          done( );
+        });
+    }
+
+    it('/times/echo refuses a prefix that expands to a million patterns', function (done) {
+      refused('/times/echo/' + million + '/T.json', done);
+    });
+
+    it('/times refuses a regex that expands to a million patterns', function (done) {
+      refused('/times/2014/' + million + '.json', done);
+    });
+
+    it('/slice refuses a prefix that expands to a million patterns', function (done) {
+      refused('/slice/entries/dateString/sgv/' + million + '.json', done);
+    });
+
+    it('/times/echo counts prefix and regex together', function (done) {
+      // 100 prefixes and 60 regexes are each allowed; 6000 together are not.
+      refused('/times/echo/20{00..99}/T{00..59}.json', done);
+    });
+
+    it('/times/echo refuses one pattern over the limit', function (done) {
+      refused('/times/echo/{1..3}{1..667}/T.json', done);
+    });
+
+    it('/times/echo expands a pattern at the limit as before', function (done) {
+      request(self.app)
+        .get('/times/echo/{1..2}{000..999}/T.json')
+        .expect(200)
+        .end(function (err, res) {
+          if (err) return done(err);
+          res.body.pattern.should.eql(require('braces').expand('^{1..2}{000..999}.*T'));
+          res.body.pattern.should.have.lengthOf(2000);
+          done( );
+        });
+    });
+
+    it('/times/echo expands the documented example as before', function (done) {
+      request(self.app)
+        .get('/times/echo/20{14..15}/T{13..18}:{00..15}.json')
+        .expect(200)
+        .end(function (err, res) {
+          if (err) return done(err);
+          res.body.pattern.should.have.lengthOf(192);
+          res.body.pattern[0].should.equal('^2014.*T13:00');
+          res.body.pattern[191].should.equal('^2015.*T18:15');
+          done( );
+        });
+    });
   });
 
   it('/entries/current.json', function (done) {
-    request(this.app)
+    request(self.app)
       .get('/entries/current.json')
       .expect(200)
-      .end(function (err, res)  {
-        res.body.length.should.equal(1);
-        done( );
-        // console.log('err', err, 'res', res);
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(1);
+        res.body[0].sgv.should.equal(100);
+        done();
       });
-
   });
 
-  it('/entries/preview', function (done) {
-
-      request(this.app)
-        .post('/entries/preview.json')
-        .send(load('json'))
-        .expect(201)
-        .end(function (err, res)  {
-          // console.log(res.body);
-          res.body.length.should.equal(30);
+  it('/entries/:id', function (done) {
+    var app = self.app;
+    self.archive.list({count: 10}, function(err, records) {
+      var currentId = records.pop()._id.toString();
+      request(app)
+        .get('/entries/'+currentId+'.json')
+        .expect(200)
+        .end(function (err, res) {
+          res.body.should.be.instanceof(Array).and.have.lengthOf(1);
+          res.body[0]._id.should.equal(currentId);
           done( );
-          // console.log('err', err, 'res', res);
-        })
-    ;
+        });
+      });
+    });
 
+  it('/entries/:model', function (done) {
+    var app = self.app;
+    request(app)
+      .get('/entries/sgv/.json?count=10&find[dateString][$gte]=2014')
+      .expect(200)
+      .end(function (err, res) {
+        res.body.should.be.instanceof(Array).and.have.lengthOf(10);
+        done( );
+      });
+  });
+
+  it('disallow POST by readable /entries/preview', function (done) {
+    request(self.app)
+      .post('/entries/preview.json')
+      .send(load('json'))
+      .expect(401)
+      .end(function () {
+        // res.body.should.be.instanceof(Array).and.have.lengthOf(30);
+        done();
+      });
+  });
+
+  it('disallow deletes unauthorized', function (done) {
+    var app = self.app;
+
+    request(app)
+      .delete('/entries/sgv?find[dateString][$gte]=2014-07-19&find[dateString][$lte]=2014-07-20')
+      .expect(401)
+      .end(function (err) {
+        if (err) {
+          done(err);
+        } else {
+          request(app)
+            .get('/entries/sgv.json?find[dateString][$gte]=2014-07-19&find[dateString][$lte]=2014-07-20')
+            .expect(200)
+            .end(function (err, res) {
+              res.body.should.be.instanceof(Array).and.have.lengthOf(10);
+              done();
+            });
+        }
+      });
+  });
+
+  it('post an entry, query, delete, verify gone', function (done) {
+    // insert a glucose entry - needs to be unique from example data
+    console.log('Inserting glucose entry')
+    request(self.app)
+      .post('/entries/')
+      .set('api-secret', known || '')
+      .send({
+        "type": "sgv", "sgv": "199", "dateString": "2014-07-20T00:44:15.000-07:00"
+        , "date": 1405791855000, "device": "dexcom", "direction": "NOT COMPUTABLE"
+      })
+      .expect(200)
+      .end(function (err) {
+        if (err) {
+          done(err);
+        } else {
+          // make sure treatment was inserted successfully
+          console.log('Ensuring glucose entry was inserted successfully');
+          request(self.app)
+            .get('/entries.json?find[dateString][$gte]=2014-07-20&count=100')
+            .set('api-secret', known || '')
+            .expect(200)
+            .expect(function (response) {
+              var entry = response.body[0];
+              entry.sgv.should.equal('199');
+              entry.utcOffset.should.equal(-420);
+            })
+            .end(function (err) {
+              if (err) {
+                done(err);
+              } else {
+                // delete the glucose entry
+                console.log('Deleting test glucose entry');
+                request(self.app)
+                  .delete('/entries.json?find[dateString][$gte]=2014-07-20&count=100')
+                  .set('api-secret', known || '')
+                  .expect(200)
+                  .end(function (err) {
+                    if (err) {
+                      done(err);
+                    } else {
+                      // make sure it was deleted
+                      console.log('Testing if glucose entry was deleted');
+                      request(self.app)
+                        .get('/entries.json?find[dateString][$gte]=2014-07-20&count=100')
+                        .set('api-secret', known || '')
+                        .expect(200)
+                        .expect(function (response) {
+                          response.body.length.should.equal(0);
+                        })
+                        .end(done);
+                    }
+                  });
+              }
+            });
+        }
+      });
+  });
+
+  it('post multiple entries, query, delete, verify gone', function (done) {
+    // insert a glucose entry - needs to be unique from example data
+    console.log('Inserting glucose entry')
+    request(self.app)
+      .post('/entries/')
+      .set('api-secret', known || '')
+      .send([{
+        "type": "sgv", "sgv": "199", "dateString": "2014-07-20T00:44:15.000-07:00"
+        , "date": 1405791855000, "device": "dexcom", "direction": "NOT COMPUTABLE"
+      }, {
+        "type": "sgv", "sgv": "200", "dateString": "2014-07-20T00:44:15.001-07:00"
+        , "date": 1405791855001, "device": "dexcom", "direction": "NOT COMPUTABLE"
+      }])
+      .expect(200)
+      .end(function (err) {
+        if (err) {
+          done(err);
+        } else {
+          // make sure treatment was inserted successfully
+          console.log('Ensuring glucose entry was inserted successfully');
+          request(self.app)
+            .get('/entries.json?find[dateString][$gte]=2014-07-20&count=100')
+            .set('api-secret', known || '')
+            .expect(200)
+            .expect(function (response) {
+              var entry = response.body[0];
+              response.body.length.should.equal(2);
+              entry.sgv.should.equal('200');
+              entry.utcOffset.should.equal(-420);
+            })
+            .end(function (err) {
+              if (err) {
+                done(err);
+              } else {
+                // delete the glucose entry
+                console.log('Deleting test glucose entry');
+                request(self.app)
+                  .delete('/entries.json?find[dateString][$gte]=2014-07-20&count=100')
+                  .set('api-secret', known || '')
+                  .expect(200)
+                  .end(function (err) {
+                    if (err) {
+                      done(err);
+                    } else {
+                      // make sure it was deleted
+                      console.log('Testing if glucose entries were deleted');
+                      request(self.app)
+                        .get('/entries.json?find[dateString][$gte]=2014-07-20&count=100')
+                        .set('api-secret', known || '')
+                        .expect(200)
+                        .expect(function (response) {
+                          response.body.length.should.equal(0);
+                        })
+                        .end(done);
+                    }
+                  });
+              }
+            });
+        }
+      });
+  });
+
+  // BF-108: xDrip4iOS deletes readings in bulk by listing their dates.
+  it('deletes the readings listed under find[date][$in] and no others', async function () {
+    const dates = [1405878255000, 1405878555000, 1405878855000];
+    const window = '/entries.json?find[date][$gte]=' + dates[0] + '&find[date][$lte]=' + dates[2] + '&count=100';
+    await request(self.app)
+      .post('/entries/')
+      .set('api-secret', known || '')
+      .send(dates.map(function (date, i) {
+        return { type: 'sgv', sgv: 120 + i, date: date, device: 'dexcom', direction: 'Flat' };
+      }))
+      .expect(200);
+
+    const before = await request(self.app).get(window).set('api-secret', known || '').expect(200);
+    before.body.length.should.equal(3);
+
+    await request(self.app)
+      .delete('/entries.json?find[type]=sgv&find[date][$in][]=' + dates[0] + '&find[date][$in][]=' + dates[2])
+      .set('api-secret', known || '')
+      .expect(200);
+
+    const after = await request(self.app).get(window).set('api-secret', known || '').expect(200);
+    after.body.map(function (entry) { return entry.date; }).should.eql([dates[1]]);
+  });
+
+  // ============================================================
+  // Single object input tests - validates response format
+  // ============================================================
+
+  it('post single entry returns array with one item', function (done) {
+    var now = Date.now();
+    var dateString = new Date(now).toISOString();
+    
+    request(self.app)
+      .post('/entries/')
+      .set('api-secret', known || '')
+      .send({
+        type: 'sgv',
+        sgv: 142,
+        date: now,
+        dateString: dateString,
+        device: 'test-device',
+        direction: 'Flat'
+      })
+      .expect(200)
+      .end(function (err, res) {
+        if (err) {
+          return done(err);
+        }
+        // Response should be an array even for single object input
+        res.body.should.be.instanceof(Array);
+        res.body.length.should.be.above(0);
+        res.body[0].should.have.property('_id');
+        res.body[0].sgv.should.equal(142);
+        res.body[0].type.should.equal('sgv');
+        res.body[0].direction.should.equal('Flat');
+
+        // Clean up
+        request(self.app)
+          .delete('/entries.json?find[date]=' + now)
+          .set('api-secret', known || '')
+          .expect(200)
+          .end(done);
+      });
+  });
+
+  it('post empty array returns empty result', function (done) {
+    request(self.app)
+      .post('/entries/')
+      .set('api-secret', known || '')
+      .send([])
+      .expect(200)
+      .end(function (err, res) {
+        if (err) {
+          return done(err);
+        }
+        // Empty input should return success with empty or minimal response
+        res.body.should.be.instanceof(Array);
+        res.body.length.should.equal(0);
+        done();
+      });
+  });
+
+  /* The cached read hands out copies, not the cache's documents. If it ever
+   * hands out the documents themselves, the `mills` fill-in below it writes
+   * straight into the cache — so seed a document with no `mills` and check the
+   * cache still has none after the read.
+   */
+  it('does not write to the cached documents while serving a read', function (done) {
+    var ctx = self.ctx;
+    var ObjectId = require('mongodb').ObjectId;
+    var seeded = {
+      _id: new ObjectId( )
+      , type: 'sgv'
+      , sgv: 123
+      , date: Date.now( ) + 60000
+      , dateString: new Date(Date.now( ) + 60000).toISOString( )
+    };
+    ctx.bus.emit('data-update', { type: 'entries', op: 'update', changes: [seeded] });
+
+    var cached = ctx.cache.entries[0];
+    cached.should.not.have.property('mills');
+
+    request(self.app)
+      .get('/entries.json?count=10')
+      .expect(200)
+      .end(function (err, res) {
+        if (err) return done(err);
+        res.body[0].sgv.should.equal(123);
+        res.body[0].mills.should.equal(seeded.date);
+        ctx.cache.entries[0].should.not.have.property('mills');
+        done( );
+      });
   });
 
 });
-
